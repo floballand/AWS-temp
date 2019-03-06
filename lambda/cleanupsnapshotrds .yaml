@@ -1,0 +1,97 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: cleanup Snapshot RDS
+Parameters:
+  CronExpression:
+    Type: String
+Resources:
+
+#Lambda function delete the older snapshot manual with a retention on 7 days
+#Lambda function execution by a cloudwatch rule on cron date
+
+  RDSCleanUpFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.7
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import boto3
+          from datetime import datetime, timedelta
+          import logging
+
+          def handler(event, context):
+            my_session = boto3.session.Session()
+            region = my_session.region_name
+            log = logging.getLogger()
+            try:
+              print("Connecting to RDS")
+              source = boto3.client('rds', region_name=region)
+            except Exception as e:
+              log.info(e)
+              raise e
+            dateLimit = datetime.today() - timedelta(days=7) #retention max (days)
+            source_snaps = source.describe_db_snapshots(SnapshotType='manual')['DBSnapshots']
+            for snapshot_name  in source_snaps:
+#                if 'nameSnap' in snapshot_name['DBSnapshotIdentifier']:
+                    if datetime.strftime(snapshot_name['SnapshotCreateTime'],"%Y-%m-%d %H:%M:%S") < dateLimit.strftime("%Y-%m-%d %H:%M:%S"):
+                        try:
+                          print('\n Suppression de  ',snapshot_name['DBSnapshotIdentifier'], snapshot_name['SnapshotCreateTime'])
+                          source.delete_db_snapshot(DBSnapshotIdentifier=snapshot_name['DBSnapshotIdentifier'])
+                        except Exception as e:
+                          log.info(e)
+                          raise e
+
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: root
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:*
+            Resource:
+              - arn:aws:logs:*:*:*
+      - PolicyName: limitedAccessSnapshotRDS
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - rds:DescribeDBSnapshots
+              - rds:DeleteDBSnapshot
+              - rds:DescribeDBSnapshotAttributes
+            Resource:
+              - '*'
+
+  PurgeSnapshotEvent:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Ref CronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt RDSCleanUpFunction.Arn
+          Id: RDSCleanUpFunction
+
+  TransformFunctionPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt RDSCleanUpFunction.Arn
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt PurgeSnapshotEvent.Arn
